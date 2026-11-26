@@ -1,0 +1,111 @@
+CREATE TABLE tbt_queue_counter (
+	id int2 DEFAULT 1 NOT NULL,
+	current_seq int2 NULL,
+	issued_at timestamptz NULL,
+	CONSTRAINT tbt_queue_counter_current_seq_check CHECK (((current_seq IS NULL) OR ((current_seq >= 0) AND (current_seq <= 259)))),
+	CONSTRAINT tbt_queue_counter_id_check CHECK ((id = 1)),
+	CONSTRAINT tbt_queue_counter_pkey PRIMARY KEY (id)
+);
+
+
+INSERT INTO tbt_queue_counter(id, current_seq, issued_at) VALUES(1, null, null);
+
+
+CREATE OR REPLACE FUNCTION public.fn_queue_clear()
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+begin
+  UPDATE tbt_queue_counter SET current_seq = NULL, issued_at = NULL WHERE id = 1;
+
+  RETURN jsonb_build_object(
+    'code', '200',
+    'msg',  'success',
+    'data', '[]'); 
+end $function$
+;
+
+
+CREATE OR REPLACE FUNCTION public.fn_queue_current()
+ RETURNS TABLE(seq smallint, issued_at timestamp with time zone)
+ LANGUAGE plpgsql
+ STABLE
+AS $function$
+begin
+  SELECT current_seq, issued_at FROM tbt_queue_counter WHERE id = 1;
+end $function$
+;
+
+
+CREATE OR REPLACE FUNCTION public.fn_queue_current_json()
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  v_seq smallint;
+  v_at  timestamptz;
+BEGIN
+
+ -- SELECT c1.seq, c1.issued_at INTO v_seq, v_at FROM fn_queue_current() c1;
+  SELECT current_seq, issued_at INTO v_seq, v_at FROM tbt_queue_counter WHERE id = 1;
+
+  RETURN jsonb_build_object(
+    'code', '200',
+    'msg',  'success',
+    'data', jsonb_build_array(jsonb_build_object(
+              'seq',         v_seq,
+              'queueNumber', CASE WHEN v_seq IS NULL THEN '00'
+                                  ELSE chr(65 + v_seq / 10) || (v_seq % 10)::text END,
+              'issuedAt',    v_at)));
+EXCEPTION
+  WHEN OTHERS THEN
+    RETURN jsonb_build_object('code', '500', 'msg', SQLERRM, 'data', '[]'::jsonb);
+END $function$
+;
+
+CREATE OR REPLACE FUNCTION public.fn_queue_issue()
+ RETURNS TABLE(seq smallint, issued_at timestamp with time zone)
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  RETURN QUERY
+  UPDATE tbt_queue_counter t
+  SET current_seq = COALESCE(t.current_seq + 1, 0),
+      issued_at   = now()
+  WHERE t.id = 1 AND (t.current_seq IS NULL OR t.current_seq < 259)
+  RETURNING t.current_seq, t.issued_at;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'queue full' USING ERRCODE = 'P0001';
+  END IF;
+END $function$
+;
+
+
+CREATE OR REPLACE FUNCTION public.fn_queue_issue_json()
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  v_seq smallint;
+  v_at  timestamptz;
+BEGIN
+  SELECT i.seq, i.issued_at INTO v_seq, v_at FROM fn_queue_issue() i;
+
+  RETURN jsonb_build_object(
+    'code', '200',
+    'msg',  'success',
+    'data', jsonb_build_array(jsonb_build_object(
+              'seq',         v_seq,
+              'queueNumber', chr(65 + v_seq / 10) || (v_seq % 10)::text,
+              'issuedAt',    v_at)));
+EXCEPTION
+  WHEN SQLSTATE 'P0001' THEN
+    IF SQLERRM = 'queue full' THEN
+      RETURN jsonb_build_object('code', '409', 'msg', 'queue full', 'data', '[]'::jsonb);
+    END IF;
+    RETURN jsonb_build_object('code', '500', 'msg', SQLERRM, 'data', '[]'::jsonb);
+  WHEN OTHERS THEN
+    RETURN jsonb_build_object('code', '500', 'msg', SQLERRM, 'data', '[]'::jsonb);
+END $function$
+;
